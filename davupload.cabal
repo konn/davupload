@@ -36,7 +36,6 @@ executable davupload
                        text,
                        http-types,
                        optparse-applicative,
-                       text-icu,
                        resourcet,
                        monad-loops,
                        stm-chans,

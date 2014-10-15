@@ -50,7 +50,9 @@ runWorker Config{..} tq = whileJust_ (atomically $ readTMChan tq) $ \fp ->
         sourceReader (responseBody rsp) $$ sinkMD5
     let remoteMD5 = either (const $ Nothing) Just eith
     origMD5 <- runResourceT $ sourceFile fp $$ sinkMD5
-    unless (remoteMD5 == Just origMD5) $ do
+    if (remoteMD5 == Just origMD5)
+      then liftIO $ putStrLn $ "Skipping: " ++ encodeString rel
+      else do
       liftIO $ putStrLn $ "Copying: " ++ encodeString rel ++ " to " ++ dest
       resl <- handle httpHandler' $ evalDAVT dest $ do
         setCreds (BS.pack user) (BS.pack passwd)
@@ -163,9 +165,8 @@ sourceDir' Config{..} = start
           mkCol `catch` \case
             StatusCodeException {} -> return False
             exc -> throwM exc
-          liftIO $ putStrLn $ "Directory created: " ++ encodeString rel
         either (\e -> liftIO $ hPutStrLn stderr $ "*** error: " ++ encodeString rel ++ ": " ++ e)
-               (const $ start ch) eith
+               (const $ liftIO (putStrLn ("Directory created: " ++ encodeString rel)) >> start ch) eith
         else C.yield ch
 
 getResourceType :: MonadIO m => DAVT m T.Text

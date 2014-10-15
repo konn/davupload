@@ -222,8 +222,8 @@ getChildren = do
                       >>= child
                       >>= checkName (\name -> nameLocalName name == "collection")
         return $ if not $ null typs
-                 then Directory $ decode $ T.concat $ child ch >>= content
-                 else Normal $ decode $ T.concat $ child ch >>= content
+                 then Directory $ decodeString $ T.unpack $ T.concat $ child ch >>= content
+                 else Normal $ decodeString $ T.unpack $ T.concat $ child ch >>= content
   setDepth depth0
   return ans
 

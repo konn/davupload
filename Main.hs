@@ -60,7 +60,7 @@ runWorker Config{..} tq = whileJust_ (atomically $ readTBMQueue tq) $ \fp ->
         setCreds (BS.pack user) (BS.pack passwd)
         putContentM' (Nothing, requestBodySourceChunked $ sourceFile fp)
       either
-        (\e -> hPutStrLn stderr $ "*** error during copying: " ++ encodeString rel ++ ": " ++ e)
+        (\e -> hPutStrLn stderr $ "*** error during copying: " ++ show (encodeString rel) ++ ": " ++ e)
         return resl
 
 httpHandler :: HttpException -> IO (Either String MD5Digest)
@@ -84,7 +84,7 @@ sourceReader br = void $ iterateUntil BS.null $ do
 handler :: FilePath -> IOException -> IO ()
 handler fp exc =
   hPutStrLn stderr $
-  concat ["*** error: " ++ encodeString fp ++ ": " ++ show exc]
+  concat ["*** error: " ++ show (encodeString fp) ++ ": " ++ show exc]
 
 config :: Parser Config
 config =
@@ -172,7 +172,7 @@ sourceDir' Config{..} = start
           mkCol `catch` \case
             StatusCodeException {} -> return False
             exc -> throwM exc
-        either (\e -> liftIO $ hPutStrLn stderr $ "*** error: " ++ encodeString rel ++ ": " ++ e)
+        either (\e -> liftIO $ hPutStrLn stderr $ "*** error: " ++ show (encodeString rel) ++ ": " ++ e)
                (const $ liftIO (putStrLn ("Directory created: " ++ encodeString rel)) >> start ch) eith
         else C.yield ch
 

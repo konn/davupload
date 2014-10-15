@@ -1,6 +1,7 @@
 {-# LANGUAGE LambdaCase, NoMonomorphismRestriction, OverloadedStrings #-}
 {-# LANGUAGE RankNTypes, RecordWildCards, TemplateHaskell             #-}
 module Main where
+import           Codec.Text.IConv                (convert)
 import           Conduit                         hiding (yield)
 import qualified Conduit                         as C
 import           Control.Concurrent.Async
@@ -13,15 +14,17 @@ import           Control.Monad.Catch             (MonadCatch, catch)
 import           Control.Monad.Loops             (iterateUntil, whileJust_)
 import           Crypto.Conduit                  (sinkHash)
 import qualified Data.ByteString.Char8           as BS
+import qualified Data.ByteString.Lazy            as LBS
 import           Data.Digest.Pure.MD5            (MD5Digest)
 import           Data.List                       (intercalate)
 import           Data.Monoid                     (mconcat)
 import qualified Data.Text                       as T
 import qualified Data.Text.Encoding              as T
 import           Filesystem                      (canonicalizePath, isDirectory)
-import           Filesystem.Path                 (splitDirectories, stripPrefix)
-import           Filesystem.Path.CurrentOS       (FilePath, decodeString)
-import           Filesystem.Path.CurrentOS       (encodeString)
+import           Filesystem.Path                 (FilePath, splitDirectories,
+                                                  stripPrefix)
+import           Filesystem.Path.CurrentOS       (decodeString)
+import           Filesystem.Path.Rules           (encode, posix)
 import           Network.HTTP.Client             (BodyReader,
                                                   HttpException (..))
 import           Network.HTTP.Client             (brRead, responseBody)
@@ -39,13 +42,14 @@ data Config = Config { fromPath :: FilePath
                      , user     :: String
                      , passwd   :: String
                      , workers  :: Int
+                     , encoding :: String
                      } deriving (Show, Eq, Ord)
 
 runWorker :: Config -> TBMQueue FilePath -> IO ()
 runWorker Config{..} tq = whileJust_ (atomically $ readTBMQueue tq) $ \fp ->
-  handle (handler fp) $ do
+  handle (handler encoding fp) $ do
     let Just rel = stripPrefix fromPath fp
-        dest = toURL ++ pathToURL rel
+        dest = toURL ++ pathToURL encoding rel
     eith <- handle httpHandler $ evalDAVT dest $ do
       setCreds (BS.pack user) (BS.pack passwd)
       withContentM $ \rsp ->
@@ -53,15 +57,18 @@ runWorker Config{..} tq = whileJust_ (atomically $ readTBMQueue tq) $ \fp ->
     let remoteMD5 = either (const $ Nothing) Just eith
     origMD5 <- runResourceT $ sourceFile fp $$ sinkMD5
     if (remoteMD5 == Just origMD5)
-      then liftIO $ putStrLn $ "Skipping: " ++ encodeString rel
+      then liftIO $ putStrLn $ "Skipping: " ++ encodeString encoding rel
       else do
-      liftIO $ putStrLn $ "Copying: " ++ encodeString rel ++ " to " ++ dest
+      liftIO $ putStrLn $ "Copying: " ++ encodeString encoding rel ++ " to " ++ dest
       resl <- handle httpHandler' $ evalDAVT dest $ do
         setCreds (BS.pack user) (BS.pack passwd)
         putContentM' (Nothing, requestBodySourceChunked $ sourceFile fp)
       either
-        (\e -> hPutStrLn stderr $ "*** error during copying: " ++ show (encodeString rel) ++ ": " ++ e)
+        (\e -> hPutStrLn stderr $ "*** error during copying: " ++ encodeString encoding rel ++ ": " ++ e)
         return resl
+
+encodeString :: String -> FilePath -> String
+encodeString enc = T.unpack . T.decodeUtf8 . LBS.toStrict . convert enc "UTF-8" . LBS.fromChunks . pure .encode posix
 
 httpHandler :: HttpException -> IO (Either String MD5Digest)
 httpHandler exc = return $ Left $ show exc
@@ -69,8 +76,8 @@ httpHandler exc = return $ Left $ show exc
 httpHandler' :: HttpException -> IO (Either String ())
 httpHandler' = return . Left . show
 
-pathToURL :: FilePath -> String
-pathToURL = intercalate "/" . map (BS.unpack . urlEncode True . T.encodeUtf8 . T.pack . encodeString) . splitDirectories
+pathToURL :: String -> FilePath -> String
+pathToURL enc = intercalate "/" . map (BS.unpack . urlEncode True . T.encodeUtf8 . T.pack . encodeString enc) . splitDirectories
 
 sinkMD5 :: Monad m => Sink BS.ByteString m MD5Digest
 sinkMD5 = sinkHash
@@ -81,10 +88,10 @@ sourceReader br = void $ iterateUntil BS.null $ do
   C.yield ch
   return ch
 
-handler :: FilePath -> IOException -> IO ()
-handler fp exc =
+handler :: String -> FilePath -> IOException -> IO ()
+handler enc fp exc =
   hPutStrLn stderr $
-  concat ["*** error: " ++ show (encodeString fp) ++ ": " ++ show exc]
+  concat ["*** error: " ++ encodeString enc fp ++ ": " ++ show exc]
 
 config :: Parser Config
 config =
@@ -110,7 +117,10 @@ config =
                                   , metavar "NUM"
                                   , help "number of worker threads (default: 10)"
                                   , value 10  ])
-
+         <*> strOption (mconcat [long "encoding", short 'c'
+                                  , metavar "ENCODING"
+                                  , help "Original encoding name, recognizable by iconv (default: UTF-8)"
+                                  , value "UTF-8" ])
 configInfo :: ParserInfo Config
 configInfo =
   info (helper <*> config) $
@@ -140,8 +150,8 @@ main = do
              else return passwd
   ch <- newTBMQueueIO (workers * 20)
   isDir <- isDirectory fromPath
-  orig <- canonicalizePath $ if isDir && last (encodeString fromPath) /= '/'
-                             then decodeString (encodeString fromPath ++ "/")
+  orig <- canonicalizePath $ if isDir && last (encodeString encoding fromPath) /= '/'
+                             then decodeString (encodeString encoding fromPath ++ "/")
                              else fromPath
   let url'' | isDir && last url' /= '/' = url' ++ "/"
             | otherwise = url'
@@ -167,13 +177,13 @@ sourceDir' Config{..} = start
       if isDir
         then do
         let Just rel = stripPrefix fromPath ch
-        eith <- evalDAVT (toURL ++ pathToURL rel) $ do
+        eith <- evalDAVT (toURL ++ pathToURL encoding rel) $ do
           setCreds (BS.pack user) (BS.pack passwd)
           mkCol `catch` \case
             StatusCodeException {} -> return False
             exc -> throwM exc
-        either (\e -> liftIO $ hPutStrLn stderr $ "*** error: " ++ show (encodeString rel) ++ ": " ++ e)
-               (const $ liftIO (putStrLn ("Directory created: " ++ encodeString rel)) >> start ch) eith
+        either (\e -> liftIO $ hPutStrLn stderr $ "*** error: " ++ encodeString encoding rel ++ ": " ++ e)
+               (const $ liftIO (putStrLn ("Directory created: " ++ encodeString encoding rel)) >> start ch) eith
         else C.yield ch
 
 getResourceType :: MonadIO m => DAVT m T.Text

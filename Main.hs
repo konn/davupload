@@ -1,61 +1,35 @@
 {-# LANGUAGE LambdaCase, NoMonomorphismRestriction, OverloadedStrings #-}
 {-# LANGUAGE RankNTypes, RecordWildCards, TemplateHaskell             #-}
 module Main where
-import           Conduit                       (runResourceT)
-import           Conduit                       (($$))
-import           Conduit                       ((=$=))
-import           Conduit                       (sourceDirectory)
-import           Conduit                       (awaitForever)
-import           Conduit                       (mapM_C)
-import           Conduit                       (Source)
-import           Conduit                       (MonadResource)
-import           Conduit                       (Producer)
-import           Conduit                       (Sink)
+import           Conduit                       hiding (yield)
 import qualified Conduit                       as C
-import           Control.Concurrent.Async      (concurrently, mapConcurrently)
-import           Control.Concurrent.STM        (atomically)
-import           Control.Concurrent.STM.TMChan (TMChan, closeTMChan, readTMChan)
-import           Control.Concurrent.STM.TMChan (writeTMChan)
-import           Control.Concurrent.STM.TMChan (newTMChanIO)
-import           Control.Exception             (IOException)
-import           Control.Exception.Base        (handle)
-import           Control.Exception.Lifted      (bracket_)
-import           Control.Exception.Lifted      (finally)
+import           Control.Concurrent.Async
+import           Control.Concurrent.STM
+import           Control.Concurrent.STM.TMChan
+import           Control.Exception             hiding (catch)
 import           Control.Lens
-import           Control.Monad                 (forM, void)
-import           Control.Monad                 (unless)
-import           Control.Monad.Catch           (MonadCatch)
-import           Control.Monad.Catch           (catch)
-import           Control.Monad.Catch           (throwM)
-import           Control.Monad.IO.Class        (MonadIO (liftIO))
-import           Control.Monad.Loops           (whileJust_)
-import           Control.Monad.Loops           (iterateUntil)
+import           Control.Monad
+import           Control.Monad.Catch           (MonadCatch, catch)
+import           Control.Monad.Loops           (iterateUntil, whileJust_)
 import           Crypto.Conduit                (sinkHash)
 import qualified Data.ByteString.Char8         as BS
-import qualified Data.ByteString.Lazy          as SBS
-import           Data.Conduit.Combinators      (sourceFile)
 import           Data.Digest.Pure.MD5          (MD5Digest)
 import           Data.List                     (intercalate)
 import           Data.Monoid                   (mconcat)
 import qualified Data.Text                     as T
 import qualified Data.Text.Encoding            as T
-import           Filesystem                    (canonicalizePath, readFile)
-import           Filesystem                    (isDirectory)
-import           Filesystem.Path               (stripPrefix)
-import           Filesystem.Path               (splitDirectories)
-import           Filesystem.Path.CurrentOS     (FilePath, decode, decodeString)
+import           Filesystem                    (canonicalizePath, isDirectory)
+import           Filesystem.Path               (splitDirectories, stripPrefix)
+import           Filesystem.Path.CurrentOS     (FilePath, decodeString)
 import           Filesystem.Path.CurrentOS     (encodeString)
-import           Network.HTTP.Client           (BodyReader, HttpException (..),
-                                                brRead, responseBody)
+import           Network.HTTP.Client           (BodyReader, HttpException (..))
+import           Network.HTTP.Client           (brRead, responseBody)
 import           Network.HTTP.Conduit          (requestBodySourceChunked)
 import           Network.HTTP.Types            (urlEncode)
 import           Network.Protocol.HTTP.DAV
 import           Options.Applicative
 import           Prelude                       hiding (FilePath, readFile)
-import           System.IO                     (hGetEcho, hPutStrLn, hSetEcho)
-import           System.IO                     (stderr, stdin)
-import           System.IO                     (stdout)
-import           System.IO                     (hFlush)
+import           System.IO                     hiding (FilePath)
 import           Text.XML                      hiding (readFile)
 import           Text.XML.Cursor
 

@@ -1,46 +1,48 @@
 {-# LANGUAGE LambdaCase, NoMonomorphismRestriction, OverloadedStrings #-}
 {-# LANGUAGE RankNTypes, RecordWildCards, TemplateHaskell             #-}
 module Main where
-import           Conduit                       hiding (yield)
-import qualified Conduit                       as C
+import           Conduit                         hiding (yield)
+import qualified Conduit                         as C
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
-import           Control.Concurrent.STM.TMChan
-import           Control.Exception             hiding (catch)
+import           Control.Concurrent.STM.TBMQueue
+import           Control.Exception               hiding (catch)
 import           Control.Lens
 import           Control.Monad
-import           Control.Monad.Catch           (MonadCatch, catch)
-import           Control.Monad.Loops           (iterateUntil, whileJust_)
-import           Crypto.Conduit                (sinkHash)
-import qualified Data.ByteString.Char8         as BS
-import           Data.Digest.Pure.MD5          (MD5Digest)
-import           Data.List                     (intercalate)
-import           Data.Monoid                   (mconcat)
-import qualified Data.Text                     as T
-import qualified Data.Text.Encoding            as T
-import           Filesystem                    (canonicalizePath, isDirectory)
-import           Filesystem.Path               (splitDirectories, stripPrefix)
-import           Filesystem.Path.CurrentOS     (FilePath, decodeString)
-import           Filesystem.Path.CurrentOS     (encodeString)
-import           Network.HTTP.Client           (BodyReader, HttpException (..))
-import           Network.HTTP.Client           (brRead, responseBody)
-import           Network.HTTP.Conduit          (requestBodySourceChunked)
-import           Network.HTTP.Types            (urlEncode)
+import           Control.Monad.Catch             (MonadCatch, catch)
+import           Control.Monad.Loops             (iterateUntil, whileJust_)
+import           Crypto.Conduit                  (sinkHash)
+import qualified Data.ByteString.Char8           as BS
+import           Data.Digest.Pure.MD5            (MD5Digest)
+import           Data.List                       (intercalate)
+import           Data.Monoid                     (mconcat)
+import qualified Data.Text                       as T
+import qualified Data.Text.Encoding              as T
+import           Filesystem                      (canonicalizePath, isDirectory)
+import           Filesystem.Path                 (splitDirectories, stripPrefix)
+import           Filesystem.Path.CurrentOS       (FilePath, decodeString)
+import           Filesystem.Path.CurrentOS       (encodeString)
+import           Network.HTTP.Client             (BodyReader,
+                                                  HttpException (..))
+import           Network.HTTP.Client             (brRead, responseBody)
+import           Network.HTTP.Conduit            (requestBodySourceChunked)
+import           Network.HTTP.Types              (urlEncode)
 import           Network.Protocol.HTTP.DAV
 import           Options.Applicative
-import           Prelude                       hiding (FilePath, readFile)
-import           System.IO                     hiding (FilePath)
-import           Text.XML                      hiding (readFile)
+import           Prelude                         hiding (FilePath, readFile)
+import           System.IO                       hiding (FilePath)
+import           Text.XML                        hiding (readFile)
 import           Text.XML.Cursor
 
 data Config = Config { fromPath :: FilePath
                      , toURL    :: String
                      , user     :: String
                      , passwd   :: String
+                     , workers  :: Int
                      } deriving (Show, Eq, Ord)
 
-runWorker :: Config -> TMChan FilePath -> IO ()
-runWorker Config{..} tq = whileJust_ (atomically $ readTMChan tq) $ \fp ->
+runWorker :: Config -> TBMQueue FilePath -> IO ()
+runWorker Config{..} tq = whileJust_ (atomically $ readTBMQueue tq) $ \fp ->
   handle (handler fp) $ do
     let Just rel = stripPrefix fromPath fp
         dest = toURL ++ pathToURL rel
@@ -104,6 +106,10 @@ config =
                                 , help "password **Strongly recomended that you not use this*** (default: empty)"
                                 , value ""
                                 ])
+         <*> option auto (mconcat [long "workers", short 'n'
+                                  , metavar "NUM"
+                                  , help "number of worker threads (default: 10)"
+                                  , value 10  ])
 
 configInfo :: ParserInfo Config
 configInfo =
@@ -132,7 +138,7 @@ main = do
   passwd' <- if null passwd
              then withEcho False (puts "PASS: " >> getLine)
              else return passwd
-  ch <- newTMChanIO
+  ch <- newTBMQueueIO (workers * 20)
   isDir <- isDirectory fromPath
   orig <- canonicalizePath $ if isDir && last (encodeString fromPath) /= '/'
                              then decodeString (encodeString fromPath ++ "/")
@@ -145,9 +151,10 @@ main = do
                   , toURL = url''
                   }
   _ <- ((runResourceT $ sourceDir' config' orig
-               $$ mapM_C (liftIO . atomically . writeTMChan ch))
+               $$ mapM_C (liftIO . atomically . writeTBMQueue ch))
     `finally` do
-      atomically (closeTMChan ch)) `concurrently` mapConcurrently id (replicate 10 $ runWorker config' ch)
+      atomically (closeTBMQueue ch))
+       `concurrently` mapConcurrently id (replicate workers $ runWorker config' ch)
   return ()
 
 sourceDir' :: (MonadCatch m, MonadResource m) => Config -> FilePath -> Producer m FilePath

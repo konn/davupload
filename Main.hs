@@ -1,13 +1,13 @@
 {-# LANGUAGE LambdaCase, NoMonomorphismRestriction, OverloadedStrings #-}
 {-# LANGUAGE RankNTypes, RecordWildCards, TemplateHaskell             #-}
 module Main where
-import           Codec.Text.IConv                (convert)
+import           Codec.Text.IConv                (Fuzzy (..), convertFuzzy)
 import           Conduit                         hiding (yield)
 import qualified Conduit                         as C
 import           Control.Concurrent.Async
 import           Control.Concurrent.STM
 import           Control.Concurrent.STM.TBMQueue
-import           Control.Exception               hiding (catch)
+import           Control.Exception.Lifted        hiding (catch)
 import           Control.Lens
 import           Control.Monad
 import           Control.Monad.Catch             (MonadCatch, catch)
@@ -25,17 +25,15 @@ import           Filesystem.Path                 (FilePath, splitDirectories,
                                                   stripPrefix)
 import           Filesystem.Path.CurrentOS       (decodeString)
 import           Filesystem.Path.Rules           (encode, posix)
-import           Network.HTTP.Client             (BodyReader,
-                                                  HttpException (..))
-import           Network.HTTP.Client             (brRead, responseBody)
+import           Network.HTTP.Client             (BodyReader)
+import           Network.HTTP.Client             (HttpException (..), brRead)
+import           Network.HTTP.Client             (responseBody)
 import           Network.HTTP.Conduit            (requestBodySourceChunked)
 import           Network.HTTP.Types              (urlEncode)
 import           Network.Protocol.HTTP.DAV
 import           Options.Applicative
 import           Prelude                         hiding (FilePath, readFile)
 import           System.IO                       hiding (FilePath)
-import           Text.XML                        hiding (readFile)
-import           Text.XML.Cursor
 
 data Config = Config { fromPath :: FilePath
                      , toURL    :: String
@@ -54,13 +52,13 @@ runWorker Config{..} tq = whileJust_ (atomically $ readTBMQueue tq) $ \fp ->
       setCreds (BS.pack user) (BS.pack passwd)
       withContentM $ \rsp ->
         sourceReader (responseBody rsp) $$ sinkMD5
-    let remoteMD5 = either (const $ Nothing) Just eith
+    let remoteMD5 = either (const Nothing) Just eith
     origMD5 <- runResourceT $ sourceFile fp $$ sinkMD5
-    if (remoteMD5 == Just origMD5)
+    if remoteMD5 == Just origMD5
       then liftIO $ putStrLn $ "Skipping: " ++ encodeString encoding rel
       else do
       liftIO $ putStrLn $ "Copying: " ++ encodeString encoding rel ++ " to " ++ dest
-      resl <- handle httpHandler' $ evalDAVT dest $ do
+      resl <- handle httpHandler $ evalDAVT dest $ do
         setCreds (BS.pack user) (BS.pack passwd)
         putContentM' (Nothing, requestBodySourceChunked $ sourceFile fp)
       either
@@ -68,13 +66,11 @@ runWorker Config{..} tq = whileJust_ (atomically $ readTBMQueue tq) $ \fp ->
         return resl
 
 encodeString :: String -> FilePath -> String
-encodeString enc = T.unpack . T.decodeUtf8 . LBS.toStrict . convert enc "UTF-8" . LBS.fromChunks . pure .encode posix
+encodeString enc = T.unpack . T.decodeUtf8 . LBS.toStrict . convertFuzzy Transliterate enc "UTF-8" . LBS.fromChunks . pure .encode posix
 
-httpHandler :: HttpException -> IO (Either String MD5Digest)
-httpHandler exc = return $ Left $ show exc
-
-httpHandler' :: HttpException -> IO (Either String ())
-httpHandler' = return . Left . show
+httpHandler :: HttpException -> IO (Either String a)
+httpHandler NoResponseDataReceived = return $ Left "Response data not recieved"
+httpHandler exc = return . Left . show $ exc
 
 pathToURL :: String -> FilePath -> String
 pathToURL enc = intercalate "/" . map (BS.unpack . urlEncode True . T.encodeUtf8 . T.pack . encodeString enc) . splitDirectories
@@ -91,7 +87,7 @@ sourceReader br = void $ iterateUntil BS.null $ do
 handler :: String -> FilePath -> IOException -> IO ()
 handler enc fp exc =
   hPutStrLn stderr $
-  concat ["*** error: " ++ encodeString enc fp ++ ": " ++ show exc]
+  concat ["*** error: ", encodeString enc fp, ": ", show exc]
 
 config :: Parser Config
 config =
@@ -136,7 +132,7 @@ data Entry = Directory FilePath
 makePrisms ''Entry
 
 puts :: String -> IO ()
-puts str = putStr str >> hFlush stdout
+puts s = putStr s >> hFlush stdout
 
 main :: IO ()
 main = do
@@ -160,10 +156,9 @@ main = do
                   , fromPath = orig
                   , toURL = url''
                   }
-  _ <- ((runResourceT $ sourceDir' config' orig
+  _ <- (runResourceT (sourceDir' config' orig
                $$ mapM_C (liftIO . atomically . writeTBMQueue ch))
-    `finally` do
-      atomically (closeTBMQueue ch))
+    `finally` atomically (closeTBMQueue ch))
        `concurrently` mapConcurrently id (replicate workers $ runWorker config' ch)
   return ()
 
@@ -177,48 +172,14 @@ sourceDir' Config{..} = start
       if isDir
         then do
         let Just rel = stripPrefix fromPath ch
-        eith <- evalDAVT (toURL ++ pathToURL encoding rel) $ do
+        eith <- liftIO $ handle httpHandler $ evalDAVT (toURL ++ pathToURL encoding rel) $ do
           setCreds (BS.pack user) (BS.pack passwd)
           mkCol `catch` \case
             StatusCodeException {} -> return False
             exc -> throwM exc
-        either (\e -> liftIO $ hPutStrLn stderr $ "*** error: " ++ encodeString encoding rel ++ ": " ++ e)
+        either (\e -> liftIO $ hPutStrLn stderr $ "*** error creating: " ++ encodeString encoding rel ++ ": " ++ e)
                (const $ liftIO (putStrLn ("Directory created: " ++ encodeString encoding rel)) >> start ch) eith
         else C.yield ch
-
-getResourceType :: MonadIO m => DAVT m T.Text
-getResourceType = do
-  depth0 <- use depth
-  setDepth $ Just Depth0
-  doc <- getPropsM
-  let ans = fromDocument doc $// checkName (\name -> nameLocalName name == "resourcetype")
-                             >=> child
-  liftIO $ print $ fromDocument doc $// checkName (\name -> nameLocalName name == "resourcetype")
-  let NodeElement el = node $ head ans
-      kind = nameLocalName $ elementName el
-  setDepth depth0
-  return kind
-
-getChildren :: MonadIO m => DAVT m [Entry]
-getChildren = do
-  depth0 <- use depth
-  setDepth $ Just Depth1
-  loc <- getDAVLocation
-  doc <- getPropsM
-  let chs = [ch | ch <- fromDocument doc $// checkName (\name -> nameLocalName name == "href")
-                , all (/= T.pack loc) $ content =<< child ch]
-  ans <- forM chs $ \ch -> do
-        let typs = parent ch
-                      >>= descendant
-                      >>= checkName (\name -> nameLocalName name == "resourcetype")
-                      >>= child
-                      >>= checkName (\name -> nameLocalName name == "collection")
-        return $ if not $ null typs
-                 then Directory $ decodeString $ T.unpack $ T.concat $ child ch >>= content
-                 else Normal $ decodeString $ T.unpack $ T.concat $ child ch >>= content
-  setDepth depth0
-  return ans
-
 
 withEcho :: Bool -> IO b -> IO b
 withEcho echo ac = do
